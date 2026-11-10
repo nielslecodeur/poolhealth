@@ -73,7 +73,7 @@ allowed_payment_tokens = ["U","USDC","USDT"]
 
 [payments.seller]
 # 所有 Seller rail 与已配置资产共用同一个 USD 标价；"0" 表示 FREE。
-price_usd = "0.10"
+price_usd = "0"
 # 使用当前网络的 canonical AssetId；顺序会保留，允许改为任意非空子集。
 # 这里只列出当前 ERC-8183 合约栈能托管的资产。要卖更多币种，需要指向
 # 支持多 token 的部署（同时设置三个 ERC8183_*_ADDRESS），再把资产加回来。
@@ -103,7 +103,7 @@ enabled = true
 # Empty means the agent wallet receives payment.
 pay_to = ""
 # Payment settles before work; this bounds only the post-settlement work.
-work_timeout_seconds = 60
+work_timeout_seconds = 120
 # Optional Bazaar metadata can be added later as scalar JSON fields under
 # [payments.b402_seller.bazaar]: info_json, schema_json, description,
 # and route_template.
@@ -111,13 +111,14 @@ work_timeout_seconds = 60
 [deploy.platform]
 terms_accepted_at = "2026-11-10T17:39:20Z"
 slug = "poolhealth"
-deployment_id = "01M738JC8GD5H41Y94SDQ95Z7S"
+deployment_id = "01M73B90Q9P5SWEZCYTPAWVE8M"
 backend = "aws"
 agent_id = "01M738JC8G4RMR02H98DJD1SPM"
 invoke_url = "https://bnbagent-api.bnbchain.world/v1/rt/01M738JC8G4RMR02H98DJD1SPM/.well-known/agent-card.json"
-last_deploy_at = "2026-11-10T17:40:12Z"
+last_deploy_at = "2026-11-10T18:27:18Z"
 
 [identity]
 endpoint = "https://bnbagent-api.bnbchain.world/v1/rt/01M738JC8G4RMR02H98DJD1SPM/.well-known/agent-card.json"
-registered_at = "2026-11-10T17:41:14.871Z"
+registered_at = "2026-11-10T18:18:23.004Z"
 agent_id = 2761
+last_register_tx = "0xa98d0162ab48961a7426e257cc703176176273eb55bda072b973eadd3908c324"

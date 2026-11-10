@@ -54,6 +54,41 @@ const NOTIFY_FUNDED: AgentSkill = {
   outputModes: ["application/json"],
 };
 
+/**
+ * Public base URL of this agent on the managed platform. The card's own `url`
+ * points at the A2A runtime; the anonymous HTTP route sits next to it.
+ */
+const PUBLIC_BASE = (
+  process.env.POOLHEALTH_PUBLIC_URL ??
+  process.env.BNBAGENT_PUBLIC_URL ??
+  "https://bnbagent-api.bnbchain.world/v1/rt/01M738JC8G4RMR02H98DJD1SPM"
+).replace(/\/+$/, "");
+
+/**
+ * Written for AI agents (Claude Code, Codex, …) that discover this card and
+ * must use the service on their own: one anonymous HTTP call, no key, no
+ * wallet, no payment.
+ */
+const AGENT_GUIDE =
+  "poolhealth: pre-trade liquidity check for any swap on BNB Chain (BSC mainnet data). " +
+  "FREE AND ANONYMOUS, NO API KEY, NO WALLET: send " +
+  `POST ${PUBLIC_BASE}/x402 with header "content-type: application/json" and body ` +
+  '{"prompt": "<swap>"}. The <swap> is plain text: "swap 5 BNB to CAKE", ' +
+  '"20000 CAKE to BTCB", "1000 USDT to 0x<token address>", or "pool 0x<V2 pool> for 3 BNB". ' +
+  "Any BSC token symbol works (a symbol shared by several tokens resolves to the most " +
+  "liquid one and the others are listed); a token address is exact. Allow up to 120 s " +
+  "(a cold start takes about 40 s). " +
+  'The response is JSON {"result": "<Markdown report>"}. ' +
+  "The report gives: verdict GREEN (<1% price impact) / ORANGE (1-5%) / " +
+  "RED (>5% or no route), the best pool or a two-hop route via WBNB or USDT, order value " +
+  "and swap cost in USD, recommended slippage and minimum received, a PancakeSwap link, " +
+  "token owner check, and a per-pool table (PancakeSwap V2 and V3, BiSwap, ApeSwap, MDEX). " +
+  'The machine-readable report is the JSON code block under the "## Data" heading: read ' +
+  "verdict, recommendation, execution.minimumReceived, execution.slippagePct and pools[]. " +
+  "Typical use: call it before executing a swap and abort or split the order when the " +
+  "verdict is RED. Read-only: it never signs or moves funds. " +
+  "Also sold as an ERC-8183 job over A2A (negotiate + notify_funded, OAuth2 required).";
+
 /** Card name from studio.toml `[project].name` (best-effort). */
 function agentName(): string {
   let name = "";
@@ -107,16 +142,7 @@ export function buildAgentCard(
   }
   return {
     name,
-    description:
-      `${name} sells a liquidity health report for a swap on BNB Chain. ` +
-      'Describe the swap in task_description, e.g. "swap 5 BNB to CAKE", ' +
-      '"tokenIn 0x… tokenOut 0x… amount 1000", or a V2 pool address with an ' +
-      "amount; any BSC token symbol works. The report gives the price impact " +
-      "on every pool found (PancakeSwap V2 and V3, BiSwap, ApeSwap, MDEX), " +
-      "flags copycat tokens sharing a symbol, the largest order that stays " +
-      "under 1% impact, the share of LP tokens burned, a replacement pool or " +
-      "two-hop route when the liquidity is too thin, and a GREEN / ORANGE / " +
-      "RED verdict. ERC-8183 seller: negotiate + notify_funded over A2A.",
+    description: AGENT_GUIDE,
     // main.ts overwrites this with $AGENTCORE_RUNTIME_URL at boot.
     // Local-dev fallback: a client-routable localhost URL (not the 0.0.0.0
     // bind address). Host via AGENT_HOST (default localhost); port via the

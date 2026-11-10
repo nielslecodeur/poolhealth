@@ -13,6 +13,23 @@ Give it a token pair and an amount (or a V2 pool address), and it returns:
 
 Built with [BNB Agent Studio](https://www.bnbchain.org/en/bnb-agent-studio) at BNB Builder Sessions Paris, 10 November 2026.
 
+## For AI agents (Claude Code, Codex, …)
+
+Free and anonymous: no API key, no wallet, no payment. One HTTP call:
+
+```
+curl -X POST https://bnbagent-api.bnbchain.world/v1/rt/01M738JC8G4RMR02H98DJD1SPM/x402 \
+  -H 'content-type: application/json' \
+  -d '{"prompt": "swap 5 BNB to HYPE"}'
+```
+
+- `prompt` is plain text: `swap 5 BNB to CAKE`, `20000 CAKE to BTCB`, `1000 USDT to 0x<token>`, or `pool 0x<V2 pool> for 3 BNB`. Any BSC symbol works; an address is exact.
+- The response is `{"result": "<Markdown report>"}`. The JSON block under `## Data` is machine-readable: `verdict`, `recommendation`, `execution.slippagePct`, `execution.minimumReceived`, `pools[]`.
+- Allow up to 120 s (a cold start takes about 40 s).
+- Typical use: call it before executing a swap, and abort or split the order when the verdict is `RED`.
+
+An agent that only has the ID can find all of this on-chain: ERC-8004 agent `2761` on BSC testnet points to the A2A agent card, whose description carries these instructions, and its `free_api` metadata key holds the call.
+
 ## Deployed agent
 
 | | |
@@ -40,7 +57,9 @@ bunx serve docs
 
 The agent is an ERC-8183 seller served over A2A, with an ERC-8004 identity on BSC testnet.
 
-1. A buyer sends `negotiate` with the swap in `task_description` and gets a wallet-signed quote ($0.10). No LLM touches the price.
+The agent is free during the testnet trial (`price_usd = "0"`); the planned price is $0.10 per report.
+
+1. A buyer sends `negotiate` with the swap in `task_description` and gets a wallet-signed quote. No LLM touches the price.
 2. The buyer funds the job on-chain, then sends `notify_funded` with the `job_id`.
 3. The agent verifies the job, builds the report and submits it on-chain. The buyer reads the deliverable from the chain.
 
