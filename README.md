@@ -1,4 +1,4 @@
-# poolhealth
+﻿# poolhealth
 
 **Can this pool take your swap?** poolhealth is a BNB Chain seller agent that checks liquidity before you sign a swap.
 
@@ -23,10 +23,12 @@ Built with [BNB Agent Studio](https://www.bnbchain.org/en/bnb-agent-studio) at B
 
 ## Live demo
 
-`site/` is a static page that runs the same engine in the browser against public BSC RPC endpoints. Nothing is signed. Serve it with any static host (GitHub Pages works as is), or locally:
+**https://nielslecodeur.github.io/poolhealth/**
+
+`docs/` is a static page (published with GitHub Pages) that runs the same engine in the browser against public BSC RPC endpoints. Nothing is signed. Serve it with any static host (GitHub Pages works as is), or locally:
 
 ```
-bunx serve site
+bunx serve docs
 ```
 
 ## Example
@@ -56,7 +58,7 @@ The agent is an ERC-8183 seller served over A2A, with an ERC-8004 identity on BS
 | `app/agent/src/unifiedMain.ts` | Wires the engine into the agent's work hook; the LLM only rewrites the numbers in plain words |
 | `app/agent/src/signing.ts` | Quotes and on-chain submission (Studio scaffold, unchanged) |
 | `app/agent/studio.toml` | Network, wallet, LLM and price |
-| `site/` | Browser demo (`poolHealth.js` is the engine bundled with `bun build`) |
+| `docs/` | Browser demo (`poolHealth.js` is the engine bundled with `bun build`) |
 
 Pool data comes from BSC mainnet because testnet pools are nearly empty. The agent itself is deployed on BSC testnet.
 

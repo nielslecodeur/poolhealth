@@ -14,7 +14,7 @@
  * plain-language note on top of these numbers (see `unifiedMain.ts`).
  */
 
-// `process` is absent when this file is bundled for the browser demo (site/).
+// `process` is absent when this file is bundled for the browser demo (docs/).
 const RPC_URLS = (
   (typeof process !== "undefined" ? process.env.POOLHEALTH_RPC_URLS : undefined) ??
   "https://bsc-dataseed.bnbchain.org,https://bsc-rpc.publicnode.com,https://bsc-dataseed1.binance.org"
