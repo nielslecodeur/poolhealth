@@ -1,0 +1,123 @@
+[project]
+name = "poolhealth-agent"
+
+[stack]
+# Project-lifetime facts: which runtime adapter recipe this Agent was
+# scaffolded against. doctor / dev / deploy read these to know what to
+# check, load, and route. runtime: agentcore | azure-foundry.
+runtime = "agentcore"
+# Public faces exposed by this one runtime and signer (canonical order):
+#   A2A — serveA2a: agent card + negotiate/notify_funded skills.
+#   MCP — streamable-HTTP /mcp: negotiate (signed quote) + notify_funded
+#         (verify → deliver → submit, synchronously within the tool call) +
+#         read-only chain tools.
+#   X402 or MPP — publish exactly one sibling B402 seller route (/x402 or
+#          /mpp). Payment-only still uses A2A as the cloud carrier but hides
+#          that native face at the public gateway.
+protocols = ["A2A","X402"]
+
+[network]
+default = "bsc-testnet"
+
+[deploy]
+# Legacy scaffold intent: this project was created for the managed BNB trial.
+# Deployment still requires an explicit `bag deploy --provider bnb` choice;
+# this field is never used as a silent provider default. Post-deploy state is
+# recorded under [deploy.platform].
+destination = "platform"
+# Artifact channel: 'zip' (evm-local default — managed runtime, no Docker)
+# or 'container' (local Docker build → brokered ECR; forced for twak).
+platform_artifact = "zip"
+packaging = "zip"
+
+[wallet]
+# Local keystore signer. The Agent is the SOLE key-holder/signer.
+# The keystore lives at the WORKSPACE root — outside app/agent (the deploy
+# codeLocation) — so no packaging path can bundle it into a deploy artifact.
+kind = "evm-local"
+signer = "local"
+keystore_dir = "../../.studio/wallets"
+# address = "0x..."   # filled by `bag wallet new`
+address = "0xd2ea1ACED9fDecCd4d1c757a0e2500BE659CFc9F"
+platform_exposed_addresses = ["0xd2ea1ACED9fDecCd4d1c757a0e2500BE659CFc9F"]
+
+[llm]
+provider = "pieverse-llm"
+model = "auto/free"
+
+[llm.pieverse]
+# Pieverse topup runs ONLY on BSC mainnet (chainId=56); decoupled from [network].default.
+network = "bsc-mainnet"
+# key_hash = "..."        # written by `bag llm activate`
+# zero-deposit default. `bag llm activate` creates the key with $0
+# allocation; switch to a paid model + `bag llm topup` only when you need it.
+initial_allocation_usd = 0
+key_hash = "2e34fc45f70bd48a8d3953c1e33d458b23168939d5f4fdc22f8bbe86cccb686c"
+
+[llm.auto_renew]
+# hook auto-allocates from Pieverse Account Balance to the API key when Key
+# Credit < min_balance_usd. Account Balance is NEVER refilled automatically
+# from your wallet UNLESS you opt in via `bag budget enable` — defaults below
+# stay in allocate-only mode. This automatic hook IS the agent's LLM-credit
+# self-top-up (NOT an LLM-callable tool).
+enabled = true            # set false to opt out of in-process auto-allocate
+min_balance_usd = 0.01    # Key Credit threshold that triggers allocate
+topup_chunk_usd = 1.0     # chunk pulled from Account Balance per allocate
+max_topup_per_day_usd = 3.0   # opt-in cap; only enforced when `bag budget enable` is on
+check_interval_seconds = 60
+
+[payments]
+# Buyer spending allow-list for `bag erc8183 buy --asset`. Match a UI
+# symbol or canonical AssetId. Narrow this to lock spending to specific stables.
+allowed_payment_tokens = ["U","USDC","USDT"]
+
+[payments.seller]
+# 所有 Seller rail 与已配置资产共用同一个 USD 标价；"0" 表示 FREE。
+price_usd = "0.10"
+# 使用当前网络的 canonical AssetId；顺序会保留，允许改为任意非空子集。
+# 这里只列出当前 ERC-8183 合约栈能托管的资产。要卖更多币种，需要指向
+# 支持多 token 的部署（同时设置三个 ERC8183_*_ADDRESS），再把资产加回来。
+assets = ["TEST_U"]
+
+[payments.erc8183]
+# Seller 价格与资产来自 [payments.seller]；本表只保留 ERC-8183 行为参数。
+enabled = true
+quote_ttl_seconds = 900                        # seconds a signed quote stays valid; SDK caps at 900 (~15min work window)
+default_estimated_completion_seconds = 600
+poll_interval_seconds = 30
+auto_settle = false                            # opt-in: detect dispute-window-elapsed → settle
+
+[storage]
+# Deliverables pinned to IPFS. upload() returns ipfs://CID, published
+# on-chain verbatim — durable, public, deploy-ready. Works with any
+# pinning service or self-hosted node: the upload endpoint is
+# STORAGE_API_URL and the write key/JWT is STORAGE_API_KEY, both in
+# .studio/.env.local.
+kind = "ipfs"
+
+
+[payments.b402_seller]
+# Public X402 seller rail mounted at /x402. Credentials stay in
+# <workspace>/.studio/.env.local and are issued per B402 environment.
+enabled = true
+# Empty means the agent wallet receives payment.
+pay_to = ""
+# Payment settles before work; this bounds only the post-settlement work.
+work_timeout_seconds = 60
+# Optional Bazaar metadata can be added later as scalar JSON fields under
+# [payments.b402_seller.bazaar]: info_json, schema_json, description,
+# and route_template.
+
+[deploy.platform]
+terms_accepted_at = "2026-11-10T17:39:20Z"
+slug = "poolhealth"
+deployment_id = "01M738JC8GD5H41Y94SDQ95Z7S"
+backend = "aws"
+agent_id = "01M738JC8G4RMR02H98DJD1SPM"
+invoke_url = "https://bnbagent-api.bnbchain.world/v1/rt/01M738JC8G4RMR02H98DJD1SPM/.well-known/agent-card.json"
+last_deploy_at = "2026-11-10T17:40:12Z"
+
+[identity]
+endpoint = "https://bnbagent-api.bnbchain.world/v1/rt/01M738JC8G4RMR02H98DJD1SPM/.well-known/agent-card.json"
+registered_at = "2026-11-10T17:41:14.871Z"
+agent_id = 2761

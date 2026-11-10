@@ -1,0 +1,176 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>poolhealth</title>
+<meta name="description" content="Check if a BNB Chain pool can absorb your swap before you sign it: price impact on every V2 pool, a better pool or route, and a clear verdict.">
+<style>
+  :root {
+    --bg: #fbfaf7; --surface: #ffffff; --ink: #17181b; --muted: #5d616b;
+    --line: #e4e2dc; --accent: #b8860b; --accent-ink: #ffffff;
+    --green: #1f7a4a; --green-bg: #e6f4ec; --orange: #a35a00; --orange-bg: #fdf0dd;
+    --red: #b3261e; --red-bg: #fbe7e5; --code: #f3f1ec;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --bg: #121316; --surface: #1b1d21; --ink: #ececef; --muted: #a2a6b0;
+      --line: #2c2f35; --accent: #f0b90b; --accent-ink: #17181b;
+      --green: #6fd39b; --green-bg: #15281e; --orange: #f4b25f; --orange-bg: #2c2112;
+      --red: #f2928b; --red-bg: #2e1715; --code: #23262b;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--ink);
+    font: 16px/1.55 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  }
+  .wrap { max-width: 960px; margin: 0 auto; padding: 0 16px; }
+  header { padding: 56px 0 32px; }
+  .tag { display: inline-block; font-size: 13px; font-weight: 600; letter-spacing: .02em;
+    color: var(--accent); margin-bottom: 12px; }
+  h1 { font-size: clamp(30px, 5vw, 44px); line-height: 1.12; margin: 0 0 14px; letter-spacing: -.02em; }
+  .lede { font-size: 18px; color: var(--muted); max-width: 640px; margin: 0; }
+  .card { background: var(--surface); border: 1px solid var(--line); border-radius: 12px; padding: 20px; }
+  form { display: grid; gap: 12px; grid-template-columns: 1fr auto; }
+  input { width: 100%; font: inherit; padding: 12px 14px; border-radius: 8px; border: 1px solid var(--line);
+    background: var(--bg); color: var(--ink); }
+  input:focus { outline: 2px solid var(--accent); outline-offset: 1px; }
+  button { font: inherit; font-weight: 600; padding: 12px 20px; border-radius: 8px; border: 0; cursor: pointer;
+    background: var(--accent); color: var(--accent-ink); }
+  button:disabled { opacity: .6; cursor: progress; }
+  .examples { grid-column: 1 / -1; display: flex; flex-wrap: wrap; gap: 8px; font-size: 14px; color: var(--muted); }
+  .chip { font-size: 13px; padding: 4px 10px; border-radius: 999px; border: 1px solid var(--line);
+    background: transparent; color: var(--ink); font-weight: 500; }
+  @media (max-width: 560px) { form { grid-template-columns: 1fr; } }
+  #out { margin-top: 20px; }
+  .status { color: var(--muted); font-size: 15px; }
+  .verdict { display: flex; gap: 14px; align-items: flex-start; padding: 16px; border-radius: 10px; margin-bottom: 18px; }
+  .verdict b { font-size: 20px; display: block; margin-bottom: 4px; }
+  .GREEN { background: var(--green-bg); color: var(--green); }
+  .ORANGE { background: var(--orange-bg); color: var(--orange); }
+  .RED { background: var(--red-bg); color: var(--red); }
+  .verdict p { margin: 0; color: var(--ink); }
+  .dot { width: 14px; height: 14px; border-radius: 50%; margin-top: 7px; flex: none; background: currentColor; }
+  h2 { font-size: 18px; margin: 22px 0 10px; }
+  .table { overflow-x: auto; border: 1px solid var(--line); border-radius: 10px; }
+  table { border-collapse: collapse; width: 100%; font-size: 14px; min-width: 640px; }
+  th, td { text-align: left; padding: 10px 12px; border-bottom: 1px solid var(--line); white-space: nowrap; }
+  th { font-weight: 600; color: var(--muted); font-size: 13px; }
+  tr:last-child td { border-bottom: 0; }
+  td.num { font-variant-numeric: tabular-nums; }
+  .pill { font-size: 12px; font-weight: 700; padding: 2px 8px; border-radius: 999px; }
+  .note { color: var(--muted); font-size: 14px; }
+  section { padding: 36px 0; border-top: 1px solid var(--line); }
+  .grid { display: grid; gap: 16px; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); }
+  .grid h3 { margin: 0 0 6px; font-size: 16px; }
+  .grid p { margin: 0; color: var(--muted); font-size: 15px; }
+  pre { background: var(--code); border-radius: 8px; padding: 14px; overflow-x: auto; font-size: 13px; margin: 0; }
+  code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+  a { color: var(--accent); }
+  footer { padding: 28px 0 48px; color: var(--muted); font-size: 14px; border-top: 1px solid var(--line); }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <div class="tag">BNB Chain seller agent · ERC-8004 · ERC-8183</div>
+    <h1>Can this pool take your swap?</h1>
+    <p class="lede">poolhealth checks every V2 pool on BNB Chain before you sign: real price impact for your amount, the largest safe order, whether the liquidity can be pulled, and a better pool or route when yours is too thin.</p>
+  </header>
+
+  <div class="card">
+    <form id="f">
+      <input id="q" autocomplete="off" spellcheck="false" aria-label="Describe your swap"
+        value="swap 40 BNB to CAKE" placeholder="swap 40 BNB to CAKE · or a token / pool address">
+      <button id="go" type="submit">Check liquidity</button>
+      <div class="examples">Try:
+        <button type="button" class="chip">swap 5 BNB to USDT</button>
+        <button type="button" class="chip">20000 CAKE to BTCB</button>
+        <button type="button" class="chip">pool 0x8840c6252e2e86e545defb6da98b2a0e26d8c1ba for 3 BNB</button>
+      </div>
+    </form>
+    <div id="out" aria-live="polite"><p class="status">Live data, read straight from BSC mainnet in your browser. Nothing is signed.</p></div>
+  </div>
+
+  <section>
+    <h2>What the agent sells</h2>
+    <div class="grid">
+      <div><h3>Price impact, per pool</h3><p>PancakeSwap, BiSwap, ApeSwap and MDEX, quoted for your exact amount from live reserves.</p></div>
+      <div><h3>Largest safe order</h3><p>The biggest swap that stays under 1% impact, so you know when to split it.</p></div>
+      <div><h3>Replacement pool or route</h3><p>If your pool is too thin, it finds a better one or a two-hop route through BNB or USDT.</p></div>
+      <div><h3>Rug signal</h3><p>Share of LP tokens burned: a low share means the liquidity can be withdrawn.</p></div>
+    </div>
+  </section>
+
+  <section>
+    <h2>Buy it from another agent</h2>
+    <p class="note">The demo above is free and runs the same deterministic engine. The agent sells the full report, with a plain-language explanation, over A2A and settles on-chain through ERC-8183. A buyer negotiates a signed quote, funds the job, then reads the deliverable from the chain.</p>
+    <pre><code>{"skill": "negotiate",
+ "task_description": "swap 40 BNB to CAKE",
+ "terms": {"deliverables": "liquidity health report",
+           "quality_standards": "live on-chain data"}}</code></pre>
+    <p class="note" id="agent-id">ERC-8004 agent ID <b>2761</b> on BSC testnet · wallet
+      <a href="https://testnet.bscscan.com/address/0xd2ea1ACED9fDecCd4d1c757a0e2500BE659CFc9F" target="_blank" rel="noopener">0xd2ea…Fc9F</a> ·
+      <a href="https://bnbagent-api.bnbchain.world/v1/rt/01M738JC8G4RMR02H98DJD1SPM/.well-known/agent-card.json" target="_blank" rel="noopener">A2A agent card</a></p>
+  </section>
+
+  <footer>Built with BNB Agent Studio at BNB Builder Sessions Paris, 10 November 2026. V2 pools only. Not financial advice.</footer>
+</div>
+
+<script type="module">
+  import { analyzeRequest } from "./poolHealth.js";
+
+  const $ = (s) => document.querySelector(s);
+  const esc = (s) => String(s).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" })[c]);
+  const short = (a) => `${a.slice(0, 6)}…${a.slice(-4)}`;
+  const LABEL = { GREEN: "Safe at this size", ORANGE: "Noticeable slippage", RED: "Do not swap here" };
+
+  function render(r) {
+    if (!r.ok) return `<p class="status">${esc(r.error)}</p>`;
+    const { tokenIn, tokenOut, amountIn, amountAssumed } = r.swap;
+    let html = `<div class="verdict ${r.verdict}"><span class="dot"></span><div>
+      <b>${r.verdict} · ${LABEL[r.verdict]}</b><p>${esc(r.recommendation)}</p>
+      ${amountAssumed ? `<p class="note">No amount given, 1 ${esc(tokenIn.symbol)} assumed.</p>` : ""}</div></div>`;
+    html += `<h2>${esc(amountIn)} ${esc(tokenIn.symbol)} → ${esc(tokenOut.symbol)}, direct pools</h2>`;
+    if (r.pools.length) {
+      html += `<div class="table"><table><thead><tr><th>DEX</th><th>You receive</th><th>Price impact</th><th>Max order under 1%</th><th>LP burned</th><th>Pool</th></tr></thead><tbody>`;
+      for (const p of r.pools) {
+        html += `<tr><td><span class="pill ${p.verdict}">${p.verdict}</span> ${esc(p.dex)}</td>
+          <td class="num">${esc(p.amountOut)}</td><td class="num">${p.priceImpactPct}%</td>
+          <td class="num">${esc(p.maxInUnder1Pct)}</td>
+          <td class="num">${p.lpBurnedPct === null ? "n/a" : p.lpBurnedPct + "%"}</td>
+          <td><a href="https://bscscan.com/address/${esc(p.pair)}" target="_blank" rel="noopener">${short(p.pair)}</a></td></tr>`;
+      }
+      html += `</tbody></table></div>`;
+    } else {
+      html += `<p class="status">No direct V2 pool found.</p>`;
+    }
+    if (r.twoHop) {
+      html += `<h2>Two-hop route via ${esc(r.twoHop.via)}</h2><p>${r.twoHop.legs
+        .map((l) => `${esc(l.dex)} (${l.priceImpactPct}% impact)`).join(" → ")} → <b>${esc(r.twoHop.amountOut)}</b></p>`;
+    }
+    html += `<p class="note">Read live from BSC mainnet at ${new Date(r.generatedAt).toLocaleTimeString()}.</p>`;
+    return html;
+  }
+
+  async function run() {
+    const q = $("#q").value.trim();
+    if (!q) return;
+    $("#go").disabled = true;
+    $("#out").innerHTML = `<p class="status">Reading pools on BSC…</p>`;
+    try {
+      $("#out").innerHTML = render(await analyzeRequest(q));
+    } catch (e) {
+      $("#out").innerHTML = `<p class="status">Could not reach BSC right now (${esc(e.message)}). Try again in a moment.</p>`;
+    } finally {
+      $("#go").disabled = false;
+    }
+  }
+
+  $("#f").addEventListener("submit", (e) => { e.preventDefault(); run(); });
+  document.querySelectorAll(".chip").forEach((b) =>
+    b.addEventListener("click", () => { $("#q").value = b.textContent; run(); }));
+</script>
+</body>
+</html>

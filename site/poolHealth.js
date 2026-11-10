@@ -1,0 +1,403 @@
+// app/agent/src/poolHealth.ts
+var RPC_URLS = ((typeof process !== "undefined" ? process.env.POOLHEALTH_RPC_URLS : undefined) ?? "https://bsc-dataseed.bnbchain.org,https://bsc-rpc.publicnode.com,https://bsc-dataseed1.binance.org").split(",").map((u) => u.trim()).filter(Boolean);
+var RPC_TIMEOUT_MS = 8000;
+var ZERO = "0x0000000000000000000000000000000000000000";
+var DEAD = "0x000000000000000000000000000000000000dead";
+var DEXES = [
+  { name: "PancakeSwap V2", factory: "0xca143ce32fe78f1f7019d7d551a6402fc5350c73", feeBps: 25 },
+  { name: "BiSwap", factory: "0x858e3312ed3a876947ea49d572a7c42de08af7ee", feeBps: 20 },
+  { name: "ApeSwap", factory: "0x0841bd0b734e4f5853f0dd8d7ea041c241fb0da6", feeBps: 20 },
+  { name: "MDEX", factory: "0x3cd1c46068daea5ebb0d3f55f6915b10648062b8", feeBps: 30 }
+];
+var KNOWN_TOKENS = {
+  WBNB: { address: "0xbb4cdb9cbd36b01bd1cbaebf2de08d9173bc095c", symbol: "WBNB", decimals: 18 },
+  USDT: { address: "0x55d398326f99059ff775485246999027b3197955", symbol: "USDT", decimals: 18 },
+  USDC: { address: "0x8ac76a51cc950d9822d68b83fe1ad97b32cd580d", symbol: "USDC", decimals: 18 },
+  BUSD: { address: "0xe9e7cea3dedca5984780bafc599bd69add087d56", symbol: "BUSD", decimals: 18 },
+  CAKE: { address: "0x0e09fabb73bd3ade0a17ecc321fd13a19e81ce82", symbol: "CAKE", decimals: 18 },
+  ETH: { address: "0x2170ed0880ac9a755fd29b2688956bd959f933f8", symbol: "ETH", decimals: 18 },
+  BTCB: { address: "0x7130d2a12b9bcbfae4f2634d864a1ee1ce3ead9c", symbol: "BTCB", decimals: 18 }
+};
+var SYMBOL_ALIASES = { BNB: "WBNB", WETH: "ETH", BTC: "BTCB" };
+var HUBS = [KNOWN_TOKENS.WBNB, KNOWN_TOKENS.USDT];
+
+class RpcRevert extends Error {
+}
+var rpcId = 0;
+async function ethCall(to, data) {
+  let lastErr = new Error("no RPC endpoint configured");
+  for (const url of RPC_URLS) {
+    try {
+      const res = await fetch(url, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          jsonrpc: "2.0",
+          id: ++rpcId,
+          method: "eth_call",
+          params: [{ to, data }, "latest"]
+        }),
+        signal: AbortSignal.timeout(RPC_TIMEOUT_MS)
+      });
+      if (!res.ok)
+        throw new Error(`HTTP ${res.status}`);
+      const body = await res.json();
+      if (body.error)
+        throw new RpcRevert(body.error.message ?? "rpc error");
+      if (typeof body.result !== "string")
+        throw new Error("malformed RPC reply");
+      const hex = body.result.replace(/^0x/, "");
+      return hex.length === 0 ? null : hex;
+    } catch (e) {
+      if (e instanceof RpcRevert)
+        return null;
+      lastErr = e;
+    }
+  }
+  throw new Error(`BSC RPC unreachable: ${lastErr instanceof Error ? lastErr.message : String(lastErr)}`);
+}
+var pad = (addr) => addr.toLowerCase().replace(/^0x/, "").padStart(64, "0");
+var word = (hex, i) => hex.slice(i * 64, (i + 1) * 64);
+var wordToAddr = (w) => `0x${w.slice(24)}`.toLowerCase();
+var wordToBig = (w) => w.length === 0 ? 0n : BigInt(`0x${w}`);
+async function callAddr(to, selector) {
+  const hex = await ethCall(to, selector);
+  return hex !== null && hex.length >= 64 ? wordToAddr(word(hex, 0)) : null;
+}
+async function callUint(to, data) {
+  const hex = await ethCall(to, data);
+  return hex !== null && hex.length >= 64 ? wordToBig(word(hex, 0)) : null;
+}
+function decodeString(hex) {
+  let bytes;
+  if (hex.length >= 192 && wordToBig(word(hex, 0)) === 32n) {
+    const len = Number(wordToBig(word(hex, 1)));
+    bytes = hex.slice(128, 128 + len * 2);
+  } else {
+    bytes = hex.slice(0, 64);
+  }
+  let out = "";
+  for (let i = 0;i + 1 < bytes.length; i += 2) {
+    const c = Number.parseInt(bytes.slice(i, i + 2), 16);
+    if (c >= 32 && c < 127)
+      out += String.fromCharCode(c);
+  }
+  return out.trim();
+}
+var tokenCache = new Map(Object.values(KNOWN_TOKENS).map((t) => [t.address, t]));
+async function loadToken(address) {
+  const addr = address.toLowerCase();
+  const cached = tokenCache.get(addr);
+  if (cached)
+    return cached;
+  const [dec, sym] = await Promise.all([
+    callUint(addr, "0x313ce567"),
+    ethCall(addr, "0x95d89b41")
+  ]);
+  if (dec === null || dec > 36n)
+    return null;
+  const token = {
+    address: addr,
+    symbol: (sym ? decodeString(sym) : "") || `${addr.slice(0, 6)}…${addr.slice(-4)}`,
+    decimals: Number(dec)
+  };
+  tokenCache.set(addr, token);
+  return token;
+}
+function parseUnits(value, decimals) {
+  const [whole = "0", frac = ""] = value.replace(",", ".").split(".");
+  const fracPadded = frac.slice(0, decimals).padEnd(decimals, "0");
+  return BigInt(whole || "0") * 10n ** BigInt(decimals) + BigInt(fracPadded || "0");
+}
+function formatUnits(value, decimals, maxFrac = 6) {
+  const base = 10n ** BigInt(decimals);
+  const whole = value / base;
+  let frac = (value % base).toString().padStart(decimals, "0").slice(0, maxFrac);
+  frac = frac.replace(/0+$/, "");
+  const wholeStr = whole.toString().replace(/\B(?=(\d{3})+(?!\d))/g, ",");
+  return frac ? `${wholeStr}.${frac}` : wholeStr;
+}
+var round = (n, d = 2) => Math.round(n * 10 ** d) / 10 ** d;
+function verdictFor(impactPct) {
+  if (impactPct < 1)
+    return "GREEN";
+  if (impactPct < 5)
+    return "ORANGE";
+  return "RED";
+}
+async function findPair(dex, a, b) {
+  const pair = await callAddr(dex.factory, `0xe6a43905${pad(a)}${pad(b)}`);
+  return pair !== null && pair !== ZERO ? pair : null;
+}
+async function quotePool(dexName, feeBps, pair, tokenIn, tokenOut, amountIn, withLpBurn) {
+  const reserves = await ethCall(pair, "0x0902f1ac");
+  if (reserves === null || reserves.length < 128)
+    return null;
+  const r0 = wordToBig(word(reserves, 0));
+  const r1 = wordToBig(word(reserves, 1));
+  const inIsToken0 = BigInt(tokenIn.address) < BigInt(tokenOut.address);
+  const rIn = inIsToken0 ? r0 : r1;
+  const rOut = inIsToken0 ? r1 : r0;
+  if (rIn === 0n || rOut === 0n)
+    return null;
+  const inWithFee = amountIn * BigInt(1e4 - feeBps);
+  const denom = rIn * 10000n + inWithFee;
+  const out = inWithFee * rOut / denom;
+  if (out === 0n)
+    return null;
+  const priceImpactPct = Number(inWithFee) / Number(denom) * 100;
+  const idealOut = Number(amountIn) * Number(rOut) / Number(rIn);
+  const totalLossPct = idealOut > 0 ? (1 - Number(out) / idealOut) * 100 : 100;
+  const maxIn = rIn / 99n * 10000n / BigInt(1e4 - feeBps);
+  let lpBurnedPct = null;
+  if (withLpBurn) {
+    const [supply, dead, zero] = await Promise.all([
+      callUint(pair, "0x18160ddd"),
+      callUint(pair, `0x70a08231${pad(DEAD)}`),
+      callUint(pair, `0x70a08231${pad(ZERO)}`)
+    ]);
+    if (supply !== null && supply > 0n) {
+      const burned = (dead ?? 0n) + (zero ?? 0n);
+      lpBurnedPct = round(Number(burned) / Number(supply) * 100, 2);
+    }
+  }
+  return {
+    dex: dexName,
+    pair,
+    feeBps,
+    reserveIn: `${formatUnits(rIn, tokenIn.decimals, 2)} ${tokenIn.symbol}`,
+    reserveOut: `${formatUnits(rOut, tokenOut.decimals, 2)} ${tokenOut.symbol}`,
+    amountOut: `${formatUnits(out, tokenOut.decimals)} ${tokenOut.symbol}`,
+    amountOutRaw: out,
+    priceImpactPct: round(priceImpactPct, 3),
+    totalLossPct: round(totalLossPct, 3),
+    maxInUnder1Pct: `${formatUnits(maxIn, tokenIn.decimals, 4)} ${tokenIn.symbol}`,
+    lpBurnedPct,
+    verdict: verdictFor(priceImpactPct)
+  };
+}
+async function quoteAllDexes(tokenIn, tokenOut, amountIn, withLpBurn) {
+  const quotes = await Promise.all(DEXES.map(async (dex) => {
+    try {
+      const pair = await findPair(dex, tokenIn.address, tokenOut.address);
+      if (pair === null)
+        return null;
+      return await quotePool(dex.name, dex.feeBps, pair, tokenIn, tokenOut, amountIn, withLpBurn);
+    } catch {
+      return null;
+    }
+  }));
+  return quotes.filter((q) => q !== null).sort((a, b) => a.amountOutRaw > b.amountOutRaw ? -1 : 1);
+}
+function parseRequest(text) {
+  const cleaned = text.replace(/\bBNB\s+(Smart\s+)?Chain\b/gi, " ");
+  const found = [];
+  for (const m of cleaned.matchAll(/0x[a-fA-F0-9]{40}(?![a-fA-F0-9])/g)) {
+    found.push({ index: m.index ?? 0, ref: m[0].toLowerCase() });
+  }
+  const noAddr = cleaned.replace(/0x[a-fA-F0-9]{40}/g, (s) => " ".repeat(s.length));
+  const symbols = [...Object.keys(KNOWN_TOKENS), ...Object.keys(SYMBOL_ALIASES)];
+  for (const m of noAddr.matchAll(new RegExp(`\\b(${symbols.join("|")})\\b`, "gi"))) {
+    const sym = m[1].toUpperCase();
+    found.push({ index: m.index ?? 0, ref: SYMBOL_ALIASES[sym] ?? sym });
+  }
+  found.sort((a, b) => a.index - b.index);
+  const refs = [];
+  for (const f of found)
+    if (!refs.includes(f.ref))
+      refs.push(f.ref);
+  const num = "(\\d+(?:[.,]\\d+)?)";
+  const amount = noAddr.match(new RegExp(`amount\\w*["'\\s:=]*${num}`, "i"))?.[1] ?? noAddr.match(new RegExp(`${num}\\s*(?:${symbols.join("|")})\\b`, "i"))?.[1] ?? noAddr.match(new RegExp(`(?:swap|sell|trade|buy)\\w*\\s+${num}`, "i"))?.[1] ?? null;
+  return { refs, amount };
+}
+async function resolveRef(ref) {
+  if (ref.startsWith("0x"))
+    return loadToken(ref);
+  return KNOWN_TOKENS[ref] ?? null;
+}
+var USAGE = 'Send a token pair and an amount, e.g. "swap 5 BNB to CAKE", ' + '"tokenIn 0x… tokenOut 0x… amount 1000", or a single V2 pool address with ' + "an amount. Known symbols: BNB, USDT, USDC, BUSD, CAKE, ETH, BTCB; any other " + "BEP-20 token works by address.";
+async function analyzeRequest(text) {
+  const parsed = parseRequest(text);
+  let tokenIn = null;
+  let tokenOut = null;
+  let requestedPool;
+  let requestedFactory = null;
+  for (const ref of parsed.refs.filter((r) => r.startsWith("0x")).slice(0, 2)) {
+    const [t0, t1, factory] = await Promise.all([
+      callAddr(ref, "0x0dfe1681"),
+      callAddr(ref, "0xd21220a7"),
+      callAddr(ref, "0xc45a0155")
+    ]);
+    if (t0 === null || t1 === null || t0 === ZERO || t1 === ZERO)
+      continue;
+    requestedPool = ref;
+    requestedFactory = factory;
+    const named = parsed.refs.filter((r) => r !== ref).map((r) => r.startsWith("0x") ? r : KNOWN_TOKENS[r]?.address).find((a) => a === t0 || a === t1);
+    const sell = named ?? t0;
+    [tokenIn, tokenOut] = await Promise.all([
+      loadToken(sell),
+      loadToken(sell === t0 ? t1 : t0)
+    ]);
+    break;
+  }
+  if (!requestedPool && parsed.refs.length >= 2) {
+    [tokenIn, tokenOut] = await Promise.all([
+      resolveRef(parsed.refs[0]),
+      resolveRef(parsed.refs[1])
+    ]);
+  }
+  if (tokenIn === null || tokenOut === null) {
+    return {
+      ok: false,
+      error: `Could not identify two tokens (or one V2 pool) in the request. ${USAGE}`
+    };
+  }
+  if (tokenIn.address === tokenOut.address) {
+    return { ok: false, error: `Both tokens are the same (${tokenIn.symbol}). ${USAGE}` };
+  }
+  const amountStr = parsed.amount ?? "1";
+  const amountIn = parseUnits(amountStr, tokenIn.decimals);
+  if (amountIn <= 0n) {
+    return { ok: false, error: `The swap amount must be greater than zero. ${USAGE}` };
+  }
+  const pools = await quoteAllDexes(tokenIn, tokenOut, amountIn, true);
+  if (requestedPool && !pools.some((p) => p.pair === requestedPool)) {
+    const known = DEXES.find((d) => d.factory === requestedFactory);
+    const q = await quotePool(known?.name ?? "Unlisted DEX (fee assumed 0.25%)", known?.feeBps ?? 25, requestedPool, tokenIn, tokenOut, amountIn, true);
+    if (q)
+      pools.push(q);
+    pools.sort((a, b) => a.amountOutRaw > b.amountOutRaw ? -1 : 1);
+  }
+  const best = pools[0];
+  let twoHop = null;
+  if (!best || best.verdict !== "GREEN") {
+    for (const hub of HUBS) {
+      if (hub.address === tokenIn.address || hub.address === tokenOut.address)
+        continue;
+      const leg1 = (await quoteAllDexes(tokenIn, hub, amountIn, false))[0];
+      if (!leg1 || leg1.amountOutRaw === 0n)
+        continue;
+      const leg2 = (await quoteAllDexes(hub, tokenOut, leg1.amountOutRaw, false))[0];
+      if (!leg2)
+        continue;
+      if (twoHop === null || leg2.amountOutRaw > twoHop.amountOutRaw) {
+        twoHop = {
+          via: hub.symbol,
+          legs: [leg1, leg2].map((l) => ({
+            dex: l.dex,
+            pair: l.pair,
+            priceImpactPct: l.priceImpactPct
+          })),
+          amountOut: leg2.amountOut,
+          amountOutRaw: leg2.amountOutRaw
+        };
+      }
+    }
+  }
+  const swapLabel = `${amountStr} ${tokenIn.symbol} → ${tokenOut.symbol}`;
+  let verdict;
+  let recommendation;
+  const hopBeatsDirect = twoHop !== null && (!best || twoHop.amountOutRaw > best.amountOutRaw);
+  if (!best && !twoHop) {
+    verdict = "RED";
+    recommendation = `No V2 pool with liquidity was found for ${tokenIn.symbol}/${tokenOut.symbol} ` + `on ${DEXES.map((d) => d.name).join(", ")}, directly or through ` + `${HUBS.map((h) => h.symbol).join(" / ")}. Do not swap ${swapLabel} on these DEXes.`;
+  } else if (hopBeatsDirect && twoHop) {
+    const worst = Math.max(...twoHop.legs.map((l) => l.priceImpactPct));
+    verdict = verdictFor(worst);
+    recommendation = `Route through ${twoHop.via}: ${twoHop.legs.map((l) => l.dex).join(" then ")} ` + `returns ${twoHop.amountOut}` + (best ? `, more than the best direct pool (${best.dex}: ${best.amountOut}).` : "; there is no direct pool.");
+  } else if (best) {
+    verdict = best.verdict;
+    const other = pools.find((p) => p.pair !== best.pair);
+    recommendation = `Use ${best.dex} (${best.pair}): ${swapLabel} returns ${best.amountOut} ` + `with ${best.priceImpactPct}% price impact.` + (other ? ` Next best is ${other.dex} with ${other.amountOut}.` : " It is the only pool found.") + (best.verdict !== "GREEN" ? ` To stay under 1% impact, keep each order below ${best.maxInUnder1Pct}.` : "");
+  } else {
+    verdict = "RED";
+    recommendation = "No usable route.";
+  }
+  if (requestedPool && best && best.pair !== requestedPool && !hopBeatsDirect) {
+    const asked = pools.find((p) => p.pair === requestedPool);
+    if (asked) {
+      recommendation += ` The pool you asked about (${asked.dex}) returns ${asked.amountOut} ` + `at ${asked.priceImpactPct}% impact — a replacement pool is better.`;
+    }
+  }
+  return {
+    ok: true,
+    swap: { tokenIn, tokenOut, amountIn: amountStr, amountAssumed: parsed.amount === null },
+    requestedPool,
+    pools,
+    best,
+    twoHop,
+    verdict,
+    recommendation,
+    generatedAt: new Date().toISOString()
+  };
+}
+var ICON = { GREEN: "\uD83D\uDFE2", ORANGE: "\uD83D\uDFE0", RED: "\uD83D\uDD34" };
+function reportData(report) {
+  return JSON.parse(JSON.stringify(report, (key, value) => key === "amountOutRaw" || typeof value === "bigint" ? undefined : value));
+}
+function renderReport(report, analystNote) {
+  if (!report.ok || !report.swap || !report.verdict) {
+    return `# poolhealth — request not understood
+
+${report.error ?? USAGE}
+`;
+  }
+  const { tokenIn, tokenOut, amountIn, amountAssumed } = report.swap;
+  const lines = [];
+  lines.push(`# poolhealth — ${amountIn} ${tokenIn.symbol} → ${tokenOut.symbol}`);
+  lines.push("");
+  lines.push(`**Verdict: ${ICON[report.verdict]} ${report.verdict}**`);
+  lines.push("");
+  lines.push(report.recommendation ?? "");
+  if (amountAssumed) {
+    lines.push("");
+    lines.push(`_No amount was given, so 1 ${tokenIn.symbol} was assumed._`);
+  }
+  lines.push("");
+  lines.push("## Direct pools");
+  lines.push("");
+  if (report.pools && report.pools.length > 0) {
+    lines.push("| DEX | You receive | Price impact | Total loss vs spot | Max order under 1% | LP burned | Pool liquidity |");
+    lines.push("| --- | --- | --- | --- | --- | --- | --- |");
+    for (const p of report.pools) {
+      lines.push(`| ${ICON[p.verdict]} ${p.dex} | ${p.amountOut} | ${p.priceImpactPct}% | ` + `${p.totalLossPct}% | ${p.maxInUnder1Pct} | ` + `${p.lpBurnedPct === null ? "n/a" : `${p.lpBurnedPct}%`} | ` + `${p.reserveIn} / ${p.reserveOut} |`);
+    }
+    lines.push("");
+    for (const p of report.pools)
+      lines.push(`- ${p.dex}: \`${p.pair}\``);
+  } else {
+    lines.push("None found.");
+  }
+  if (report.twoHop) {
+    lines.push("");
+    lines.push("## Two-hop route");
+    lines.push("");
+    lines.push(`Via ${report.twoHop.via}: ` + report.twoHop.legs.map((l) => `${l.dex} (${l.priceImpactPct}% impact)`).join(" → ") + ` → **${report.twoHop.amountOut}**`);
+  }
+  if (analystNote) {
+    lines.push("");
+    lines.push("## In plain words");
+    lines.push("");
+    lines.push(analystNote);
+  }
+  lines.push("");
+  lines.push("## How to read this");
+  lines.push("");
+  lines.push("- Verdict: GREEN under 1% price impact, ORANGE from 1% to 5%, RED above 5% or no route.");
+  lines.push("- LP burned: share of the pool's LP tokens sent to a dead address. A low share means liquidity can be withdrawn; liquidity held in a lock contract is not detected.");
+  lines.push("- V2 (constant-product) pools only, read live from BSC mainnet at " + `${report.generatedAt}. Fees are each DEX's nominal fee. Not financial advice.`);
+  lines.push("");
+  lines.push("## Data");
+  lines.push("");
+  lines.push("```json");
+  lines.push(JSON.stringify(reportData(report), null, 2));
+  lines.push("```");
+  return lines.join(`
+`);
+}
+export {
+  analyzeRequest,
+  parseRequest,
+  renderReport,
+  reportData
+};
