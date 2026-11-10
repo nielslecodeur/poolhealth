@@ -185,6 +185,8 @@ export interface PoolQuote {
   maxInUnder1Pct: string;
   lpBurnedPct: number | null;
   verdict: Verdict;
+  /** USD given up versus the best direct pool for this order (filled by the report). */
+  lossUsd?: number | null;
 }
 
 export type Verdict = "GREEN" | "ORANGE" | "RED";
@@ -368,7 +370,10 @@ const STOPWORDS = new Set(
     "best price impact please what if en vers contre pour de du des le la les un " +
     "une mon ma mes je veux combien est ce que avec sur et ou dans par echanger " +
     "échanger vendre acheter convertir analyse analyser verifier vérifier " +
-    "chain smart dex v2 v3")
+    "chain smart dex v2 v3 you your we our are was were be been accepted paid " +
+    "following job produce deliverable deliverables now complete self contained " +
+    "context task terms report health data live quality standards safe at size " +
+    "this that will would should give get need using use")
     .split(/\s+/),
 );
 
@@ -510,6 +515,18 @@ export interface PoolHealthReport {
   generatedAt?: string;
   /** How symbols were resolved, ambiguity warnings. */
   notes?: string[];
+  /** What to set in the wallet before signing (null when the verdict is RED). */
+  execution?: ExecutionPlan | null;
+  tokenChecks?: TokenCheck[];
+}
+
+export interface ExecutionPlan {
+  slippagePct: number;
+  minimumReceived: string;
+  amountInUsd: number | null;
+  /** Fees + price impact on the recommended direct pool, in USD. */
+  costUsd: number | null;
+  pancakeSwapUrl: string;
 }
 
 const USAGE =
@@ -629,7 +646,7 @@ export async function analyzeRequest(text: string): Promise<PoolHealthReport> {
   if (!best && !twoHop) {
     verdict = "RED";
     recommendation =
-      `No V2 pool with liquidity was found for ${tokenIn.symbol}/${tokenOut.symbol} ` +
+      `No pool with liquidity was found for ${tokenIn.symbol}/${tokenOut.symbol} ` +
       `on ${DEXES.map((d) => d.name).join(", ")}, directly or through ` +
       `${HUBS.map((h) => h.symbol).join(" / ")}. Do not swap ${swapLabel} on these DEXes.`;
   } else if (hopBeatsDirect && twoHop) {
@@ -665,6 +682,43 @@ export async function analyzeRequest(text: string): Promise<PoolHealthReport> {
     }
   }
 
+  // ── "before you sign": dollar cost, slippage setting, link, token checks ──
+  const [priceUsd, ownerChecks] = await Promise.all([
+    tokenUsdPrice(tokenIn).catch(() => null),
+    Promise.all([tokenIn, tokenOut].map((t) => ownerCheck(t).catch(() => null))),
+  ]);
+  const amountInUsd = priceUsd !== null ? Number(amountStr.replace(",", ".")) * priceUsd : null;
+  // Per pool: dollars given up versus the best direct pool (one common
+  // reference, so the column always ranks the pools the same way).
+  const bestOut = pools[0]?.amountOutRaw;
+  for (const p of pools) {
+    p.lossUsd =
+      amountInUsd !== null && bestOut !== undefined && bestOut > 0n
+        ? round(amountInUsd * (1 - Number(p.amountOutRaw) / Number(bestOut)), 2)
+        : null;
+  }
+
+  let execution: ExecutionPlan | null = null;
+  const chosenOut = hopBeatsDirect && twoHop ? twoHop.amountOutRaw : best?.amountOutRaw;
+  if (chosenOut !== undefined && chosenOut > 0n && verdict !== "RED") {
+    // Price impact is already inside the quote; the tolerance only has to
+    // absorb price moves between this report and the signature.
+    const slippagePct = verdict === "GREEN" ? 0.5 : 1;
+    const minOut = (chosenOut * BigInt(Math.round((100 - slippagePct) * 100))) / 10000n;
+    const routeLossPct =
+      hopBeatsDirect || !best ? null : best.totalLossPct;
+    execution = {
+      slippagePct,
+      minimumReceived: `${formatUnits(minOut, tokenOut.decimals)} ${tokenOut.symbol}`,
+      amountInUsd: amountInUsd !== null ? round(amountInUsd, 2) : null,
+      costUsd:
+        amountInUsd !== null && routeLossPct !== null
+          ? round((amountInUsd * routeLossPct) / 100, 2)
+          : null,
+      pancakeSwapUrl: pancakeSwapUrl(tokenIn, tokenOut, amountStr),
+    };
+  }
+
   return {
     ok: true,
     swap: { tokenIn, tokenOut, amountIn: amountStr, amountAssumed: parsed.amount === null },
@@ -674,14 +728,84 @@ export async function analyzeRequest(text: string): Promise<PoolHealthReport> {
     twoHop,
     verdict,
     recommendation,
+    execution,
+    tokenChecks: ownerChecks.filter((c): c is TokenCheck => c !== null),
     generatedAt: new Date().toISOString(),
     notes,
   };
 }
 
+// ── pricing, owner check, swap link ─────────────────────────────────────────
+
+const STABLES = new Set(
+  [KNOWN_TOKENS.USDT!, KNOWN_TOKENS.USDC!, KNOWN_TOKENS.BUSD!].map((t) => t.address),
+);
+
+/** USD price of one whole token, from a small quote into USDT (direct or via WBNB). */
+async function tokenUsdPrice(token: Token): Promise<number | null> {
+  if (STABLES.has(token.address)) return 1;
+  const usdt = KNOWN_TOKENS.USDT!;
+  const wbnb = KNOWN_TOKENS.WBNB!;
+  const unit = 10n ** BigInt(token.decimals);
+  const probe = unit / 100n > 0n ? unit / 100n : 1n; // 0.01 token: negligible impact
+  const toUsd = (out: bigint) =>
+    Number(out) / 10 ** usdt.decimals / (Number(probe) / 10 ** token.decimals);
+  const direct = (await quoteAllDexes(token, usdt, probe, false))[0];
+  if (direct && direct.priceImpactPct < 5) return toUsd(direct.amountOutRaw);
+  if (token.address === wbnb.address) return direct ? toUsd(direct.amountOutRaw) : null;
+  const leg1 = (await quoteAllDexes(token, wbnb, probe, false))[0];
+  if (!leg1) return direct ? toUsd(direct.amountOutRaw) : null;
+  const leg2 = (await quoteAllDexes(wbnb, usdt, leg1.amountOutRaw, false))[0];
+  return leg2 ? toUsd(leg2.amountOutRaw) : null;
+}
+
+export interface TokenCheck {
+  token: string;
+  address: string;
+  owner: "renounced" | "active" | "none";
+  ownerAddress?: string;
+  message: string;
+}
+
+/** Who can still change the token: owner() renounced, held, or absent. */
+async function ownerCheck(token: Token): Promise<TokenCheck | null> {
+  if (Object.values(KNOWN_TOKENS).some((t) => t.address === token.address)) return null;
+  const owner = await callAddr(token.address, "0x8da5cb5b"); // owner()
+  if (owner === null) {
+    return {
+      token: token.symbol, address: token.address, owner: "none",
+      message: `${token.symbol} exposes no owner() function: ownership could not be checked.`,
+    };
+  }
+  if (owner === ZERO || owner === DEAD) {
+    return {
+      token: token.symbol, address: token.address, owner: "renounced",
+      message: `${token.symbol} ownership is renounced: no admin can change the contract settings.`,
+    };
+  }
+  return {
+    token: token.symbol, address: token.address, owner: "active", ownerAddress: owner,
+    message:
+      `${token.symbol} still has an owner (${owner}). Depending on the contract, ` +
+      "the owner may be able to change fees, pause trading or blacklist wallets.",
+  };
+}
+
+function pancakeSwapUrl(tokenIn: Token, tokenOut: Token, amount: string): string {
+  const id = (t: Token) => (t.address === KNOWN_TOKENS.WBNB!.address ? "BNB" : t.address);
+  return (
+    "https://pancakeswap.finance/swap?chain=bsc" +
+    `&inputCurrency=${id(tokenIn)}&outputCurrency=${id(tokenOut)}` +
+    `&exactAmount=${encodeURIComponent(amount.replace(",", "."))}&exactField=input`
+  );
+}
+
 // ── rendering ────────────────────────────────────────────────────────────────
 
 const ICON: Record<Verdict, string> = { GREEN: "🟢", ORANGE: "🟠", RED: "🔴" };
+
+const money = (n: number) =>
+  `$${n.toLocaleString("en-US", { maximumFractionDigits: n < 100 ? 2 : 0 })}`;
 
 /** JSON-safe view of the report (bigints dropped) for machine buyers. */
 export function reportData(report: PoolHealthReport): Record<string, unknown> {
@@ -711,15 +835,36 @@ export function renderReport(report: PoolHealthReport, analystNote: string): str
     lines.push("");
     lines.push(`_No amount was given, so 1 ${tokenIn.symbol} was assumed._`);
   }
+  const ex = report.execution;
+  const checks = report.tokenChecks ?? [];
+  if (ex || checks.length > 0) {
+    lines.push("");
+    lines.push("## Before you sign");
+    lines.push("");
+    if (ex) {
+      if (ex.amountInUsd !== null) {
+        lines.push(`- Order value: about ${money(ex.amountInUsd)}.`);
+      }
+      if (ex.costUsd !== null) {
+        lines.push(`- Cost of this swap on the recommended pool (fees + price impact): about ${money(ex.costUsd)}.`);
+      }
+      lines.push(`- Set your slippage tolerance to **${ex.slippagePct}%**: minimum received **${ex.minimumReceived}**. Price impact is already in the quote; the tolerance only covers price moves before you sign.`);
+      lines.push(`- Open this swap on PancakeSwap: ${ex.pancakeSwapUrl}`);
+    }
+    for (const c of checks) {
+      lines.push(`- ${c.owner === "active" ? "⚠ " : ""}${c.message}`);
+    }
+  }
   lines.push("");
   lines.push("## Direct pools");
   lines.push("");
   if (report.pools && report.pools.length > 0) {
-    lines.push("| DEX | You receive | Price impact | Total loss vs spot | Max order under 1% | LP burned | Pool liquidity |");
-    lines.push("| --- | --- | --- | --- | --- | --- | --- |");
+    lines.push("| DEX | You receive | Price impact | Lost vs best pool (USD) | Total loss vs spot | Max order under 1% | LP burned | Pool liquidity |");
+    lines.push("| --- | --- | --- | --- | --- | --- | --- | --- |");
     for (const p of report.pools) {
       lines.push(
         `| ${ICON[p.verdict]} ${p.dex} | ${p.amountOut} | ${p.priceImpactPct}% | ` +
+          `${p.lossUsd == null ? "n/a" : money(p.lossUsd)} | ` +
           `${p.totalLossPct}% | ${p.maxInUnder1Pct} | ` +
           `${p.lpBurnedPct === null ? "n/a" : `${p.lpBurnedPct}%`} | ` +
           `${p.reserveIn} / ${p.reserveOut} |`,

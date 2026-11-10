@@ -201,7 +201,7 @@ export function buildRunWork(): RunWork {
     // poolhealth: the numbers are computed deterministically from on-chain
     // reads (poolHealth.ts). The LLM only rewrites them in plain words and
     // never changes them; if it is unavailable the report still ships.
-    const report = await analyzeRequest(prompt);
+    const report = await analyzeRequest(extractTask(prompt));
     let note = "";
     if (report.ok) {
       try {
@@ -212,8 +212,10 @@ export function buildRunWork(): RunWork {
             "You explain a liquidity report to someone about to swap tokens on " +
             "BNB Chain. Write 3 to 5 short sentences in plain English: whether " +
             "the swap is safe at this size, which pool or route to use and why, " +
-            "and one caution if the LP-burned share is low or the impact is " +
-            "high. Use ONLY the numbers in the JSON; never invent or recompute " +
+            "what it costs in dollars and which slippage to set if those are " +
+            "given, and one caution if the LP-burned share is low, the token " +
+            "still has an owner, or the impact is high. " +
+            "Use ONLY the numbers in the JSON; never invent or recompute " +
             "figures. No headings, no lists, no markdown. Put your answer on " +
             'one final line that starts with "FINAL:".',
           prompt: JSON.stringify(reportData(report)),
@@ -229,6 +231,25 @@ export function buildRunWork(): RunWork {
     }
     return renderReport(report, note);
   };
+}
+
+/**
+ * The buyer's own request. ERC-8183 delivery wraps the signed task in a
+ * fixed preamble ("You accepted and were paid… JOB CONTEXT: {task, terms}");
+ * only `task` describes the swap. x402 passes the request through as is.
+ */
+export function extractTask(prompt: string): string {
+  const marker = prompt.indexOf("JOB CONTEXT:");
+  if (marker < 0) return prompt;
+  try {
+    const ctx = JSON.parse(prompt.slice(marker + "JOB CONTEXT:".length).trim()) as {
+      task?: unknown;
+    };
+    if (typeof ctx.task === "string" && ctx.task.trim()) return ctx.task;
+  } catch {
+    // not JSON: fall through to the text after the marker
+  }
+  return prompt.slice(marker + "JOB CONTEXT:".length);
 }
 
 /**
