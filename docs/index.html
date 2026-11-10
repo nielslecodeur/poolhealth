@@ -87,6 +87,7 @@
       <div class="examples">Try:
         <button type="button" class="chip">swap 5 BNB to USDT</button>
         <button type="button" class="chip">20000 CAKE to BTCB</button>
+        <button type="button" class="chip">5 BNB to HYPE</button>
         <button type="button" class="chip">pool 0x8840c6252e2e86e545defb6da98b2a0e26d8c1ba for 3 BNB</button>
       </div>
     </form>
@@ -96,7 +97,8 @@
   <section>
     <h2>What the agent sells</h2>
     <div class="grid">
-      <div><h3>Price impact, per pool</h3><p>PancakeSwap, BiSwap, ApeSwap and MDEX, quoted for your exact amount from live reserves.</p></div>
+      <div><h3>Price impact, per pool</h3><p>PancakeSwap V2 and V3, BiSwap, ApeSwap and MDEX, quoted for your exact amount from live on-chain data.</p></div>
+      <div><h3>Any token, copycats flagged</h3><p>Type a symbol like HYPE: it picks the most liquid token with that name and warns you about the copies.</p></div>
       <div><h3>Largest safe order</h3><p>The biggest swap that stays under 1% impact, so you know when to split it.</p></div>
       <div><h3>Replacement pool or route</h3><p>If your pool is too thin, it finds a better one or a two-hop route through BNB or USDT.</p></div>
       <div><h3>Rug signal</h3><p>Share of LP tokens burned: a low share means the liquidity can be withdrawn.</p></div>
@@ -132,6 +134,7 @@
     let html = `<div class="verdict ${r.verdict}"><span class="dot"></span><div>
       <b>${r.verdict} · ${LABEL[r.verdict]}</b><p>${esc(r.recommendation)}</p>
       ${amountAssumed ? `<p class="note">No amount given, 1 ${esc(tokenIn.symbol)} assumed.</p>` : ""}</div></div>`;
+    for (const n of r.notes || []) html += `<p class="note">⚠ ${esc(n)}</p>`;
     html += `<h2>${esc(amountIn)} ${esc(tokenIn.symbol)} → ${esc(tokenOut.symbol)}, direct pools</h2>`;
     if (r.pools.length) {
       html += `<div class="table"><table><thead><tr><th>DEX</th><th>You receive</th><th>Price impact</th><th>Max order under 1%</th><th>LP burned</th><th>Pool</th></tr></thead><tbody>`;
@@ -140,7 +143,7 @@
           <td class="num">${esc(p.amountOut)}</td><td class="num">${p.priceImpactPct}%</td>
           <td class="num">${esc(p.maxInUnder1Pct)}</td>
           <td class="num">${p.lpBurnedPct === null ? "n/a" : p.lpBurnedPct + "%"}</td>
-          <td><a href="https://bscscan.com/address/${esc(p.pair)}" target="_blank" rel="noopener">${short(p.pair)}</a></td></tr>`;
+          <td>${p.pair ? `<a href="https://bscscan.com/address/${esc(p.pair)}" target="_blank" rel="noopener">${short(p.pair)}</a>` : "—"}</td></tr>`;
       }
       html += `</tbody></table></div>`;
     } else {

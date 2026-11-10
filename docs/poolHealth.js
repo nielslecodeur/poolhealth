@@ -176,8 +176,48 @@ async function quotePool(dexName, feeBps, pair, tokenIn, tokenOut, amountIn, wit
     verdict: verdictFor(priceImpactPct)
   };
 }
+var PANCAKE_V3_QUOTER = "0xb048bbc1ee6b733fffcfb9e9cef7375518e25997";
+var V3_FEE_TIERS = [100, 500, 2500, 1e4];
+async function v3Out(tokenIn, tokenOut, amountIn, fee) {
+  const data = "0xc6a5026a" + pad(tokenIn.address) + pad(tokenOut.address) + amountIn.toString(16).padStart(64, "0") + fee.toString(16).padStart(64, "0") + "0".repeat(64);
+  const out = await callUint(PANCAKE_V3_QUOTER, data);
+  return out !== null && out > 0n ? out : null;
+}
+async function quoteV3(tokenIn, tokenOut, amountIn) {
+  const probe = amountIn / 1000n > 0n ? amountIn / 1000n : amountIn;
+  const quotes = await Promise.all(V3_FEE_TIERS.map(async (fee) => {
+    try {
+      const [out, outProbe] = await Promise.all([
+        v3Out(tokenIn, tokenOut, amountIn, fee),
+        v3Out(tokenIn, tokenOut, probe, fee)
+      ]);
+      if (out === null || outProbe === null)
+        return null;
+      const ratio = Number(out) / Number(amountIn) / (Number(outProbe) / Number(probe));
+      const priceImpactPct = Math.max(0, (1 - ratio) * 100);
+      return {
+        dex: `PancakeSwap V3 (${fee / 1e4}% tier)`,
+        pair: "",
+        feeBps: fee / 100,
+        reserveIn: "n/a (V3)",
+        reserveOut: "n/a (V3)",
+        amountOut: `${formatUnits(out, tokenOut.decimals)} ${tokenOut.symbol}`,
+        amountOutRaw: out,
+        priceImpactPct: round(priceImpactPct, 3),
+        totalLossPct: round(priceImpactPct + fee / 1e4, 3),
+        maxInUnder1Pct: "n/a (V3)",
+        lpBurnedPct: null,
+        verdict: verdictFor(priceImpactPct)
+      };
+    } catch {
+      return null;
+    }
+  }));
+  return quotes.filter((q) => q !== null);
+}
 async function quoteAllDexes(tokenIn, tokenOut, amountIn, withLpBurn) {
-  const quotes = await Promise.all(DEXES.map(async (dex) => {
+  const v3 = quoteV3(tokenIn, tokenOut, amountIn);
+  const v2 = await Promise.all(DEXES.map(async (dex) => {
     try {
       const pair = await findPair(dex, tokenIn.address, tokenOut.address);
       if (pair === null)
@@ -187,8 +227,11 @@ async function quoteAllDexes(tokenIn, tokenOut, amountIn, withLpBurn) {
       return null;
     }
   }));
-  return quotes.filter((q) => q !== null).sort((a, b) => a.amountOutRaw > b.amountOutRaw ? -1 : 1);
+  const all = [...v2.filter((q) => q !== null), ...await v3].sort((a, b) => a.amountOutRaw > b.amountOutRaw ? -1 : 1);
+  const usable = all.filter((q) => q.priceImpactPct < 99);
+  return usable.length > 0 ? usable : all;
 }
+var STOPWORDS = new Set(("swap swaps swapping sell buy trade trading exchange convert change to into " + "for from of on in with and or the a an my me i want how much is it can " + "check pool pools pair amount tokenin tokenout token tokens liquidity route " + "best price impact please what if en vers contre pour de du des le la les un " + "une mon ma mes je veux combien est ce que avec sur et ou dans par echanger " + "échanger vendre acheter convertir analyse analyser verifier vérifier " + "chain smart dex v2 v3").split(/\s+/));
 function parseRequest(text) {
   const cleaned = text.replace(/\bBNB\s+(Smart\s+)?Chain\b/gi, " ");
   const found = [];
@@ -196,10 +239,18 @@ function parseRequest(text) {
     found.push({ index: m.index ?? 0, ref: m[0].toLowerCase() });
   }
   const noAddr = cleaned.replace(/0x[a-fA-F0-9]{40}/g, (s) => " ".repeat(s.length));
-  const symbols = [...Object.keys(KNOWN_TOKENS), ...Object.keys(SYMBOL_ALIASES)];
-  for (const m of noAddr.matchAll(new RegExp(`\\b(${symbols.join("|")})\\b`, "gi"))) {
-    const sym = m[1].toUpperCase();
-    found.push({ index: m.index ?? 0, ref: SYMBOL_ALIASES[sym] ?? sym });
+  for (const m of noAddr.matchAll(/(?<![A-Za-z])([A-Za-z$][A-Za-z0-9$]{1,14})(?![A-Za-z0-9])/g)) {
+    const word = m[1].replace(/^\$/, "");
+    const upper = word.toUpperCase();
+    let ref = null;
+    if (SYMBOL_ALIASES[upper])
+      ref = SYMBOL_ALIASES[upper];
+    else if (KNOWN_TOKENS[upper])
+      ref = upper;
+    else if (!STOPWORDS.has(word.toLowerCase()) && word.length >= 2)
+      ref = `?${upper}`;
+    if (ref)
+      found.push({ index: m.index ?? 0, ref });
   }
   found.sort((a, b) => a.index - b.index);
   const refs = [];
@@ -207,21 +258,71 @@ function parseRequest(text) {
     if (!refs.includes(f.ref))
       refs.push(f.ref);
   const num = "(\\d+(?:[.,]\\d+)?)";
-  const amount = noAddr.match(new RegExp(`amount\\w*["'\\s:=]*${num}`, "i"))?.[1] ?? noAddr.match(new RegExp(`${num}\\s*(?:${symbols.join("|")})\\b`, "i"))?.[1] ?? noAddr.match(new RegExp(`(?:swap|sell|trade|buy)\\w*\\s+${num}`, "i"))?.[1] ?? null;
+  const amount = noAddr.match(new RegExp(`amount\\w*["'\\s:=]*${num}`, "i"))?.[1] ?? noAddr.match(new RegExp(`${num}\\s*[A-Za-z$]`))?.[1] ?? noAddr.match(new RegExp(`(?:swap|sell|trade|buy)\\w*\\s+${num}`, "i"))?.[1] ?? noAddr.match(/(\d+(?:[.,]\d+)?)/)?.[1] ?? null;
   return { refs, amount };
 }
-async function resolveRef(ref) {
+async function searchSymbol(symbol) {
+  const queries = [`${symbol} WBNB`, `${symbol} USDT`, symbol];
+  const liq = new Map;
+  await Promise.all(queries.map(async (q) => {
+    try {
+      const res = await fetch(`https://api.dexscreener.com/latest/dex/search?q=${encodeURIComponent(q)}`, { signal: AbortSignal.timeout(RPC_TIMEOUT_MS) });
+      if (!res.ok)
+        return;
+      const body = await res.json();
+      const seen = new Set;
+      for (const p of body.pairs ?? []) {
+        if (p.chainId !== "bsc" || !p.pairAddress || seen.has(p.pairAddress))
+          continue;
+        seen.add(p.pairAddress);
+        for (const side of [p.baseToken, p.quoteToken]) {
+          if (side?.address && side.symbol?.toUpperCase() === symbol) {
+            const a = side.address.toLowerCase();
+            liq.set(a, Math.max(liq.get(a) ?? 0, 0) + (p.liquidity?.usd ?? 0));
+          }
+        }
+      }
+    } catch {}
+  }));
+  if (liq.size === 0)
+    return null;
+  const ranked = [...liq.entries()].sort((a, b) => b[1] - a[1]);
+  const [address, liquidityUsd] = ranked[0];
+  return {
+    address,
+    candidates: ranked.length,
+    liquidityUsd,
+    others: ranked.slice(1, 4).map(([a, l]) => ({ address: a, liquidityUsd: l }))
+  };
+}
+var usd = (n) => n >= 1e6 ? `$${(n / 1e6).toFixed(1)}M` : n >= 1000 ? `$${Math.round(n / 1000)}k` : `$${Math.round(n)}`;
+async function resolveRef(ref, notes) {
   if (ref.startsWith("0x"))
     return loadToken(ref);
-  return KNOWN_TOKENS[ref] ?? null;
+  if (!ref.startsWith("?"))
+    return KNOWN_TOKENS[ref] ?? null;
+  const symbol = ref.slice(1);
+  const match = await searchSymbol(symbol);
+  if (!match)
+    return null;
+  const token = await loadToken(match.address);
+  if (!token)
+    return null;
+  if (match.candidates > 1) {
+    notes.push(`${symbol} matches ${match.candidates} different tokens on BSC. Using ` + `${match.address} (the most liquid, about ${usd(match.liquidityUsd)} listed). ` + `Others: ${match.others.map((o) => `${o.address} (${usd(o.liquidityUsd)})`).join(", ")}. ` + "Copycat tokens reuse popular names: check the address before you trade.");
+  } else {
+    notes.push(`${symbol} resolved to ${match.address} (about ${usd(match.liquidityUsd)} listed on BSC).`);
+  }
+  return token;
 }
-var USAGE = 'Send a token pair and an amount, e.g. "swap 5 BNB to CAKE", ' + '"tokenIn 0x… tokenOut 0x… amount 1000", or a single V2 pool address with ' + "an amount. Known symbols: BNB, USDT, USDC, BUSD, CAKE, ETH, BTCB; any other " + "BEP-20 token works by address.";
+var USAGE = 'Send a token pair and an amount, e.g. "swap 5 BNB to CAKE", ' + '"tokenIn 0x… tokenOut 0x… amount 1000", or a single V2 pool address with ' + "an amount. Any BSC token symbol works (it is looked up by liquidity); a " + "token address is the most precise.";
 async function analyzeRequest(text) {
   const parsed = parseRequest(text);
   let tokenIn = null;
   let tokenOut = null;
   let requestedPool;
   let requestedFactory = null;
+  const notes = [];
   for (const ref of parsed.refs.filter((r) => r.startsWith("0x")).slice(0, 2)) {
     const [t0, t1, factory] = await Promise.all([
       callAddr(ref, "0x0dfe1681"),
@@ -240,16 +341,22 @@ async function analyzeRequest(text) {
     ]);
     break;
   }
-  if (!requestedPool && parsed.refs.length >= 2) {
-    [tokenIn, tokenOut] = await Promise.all([
-      resolveRef(parsed.refs[0]),
-      resolveRef(parsed.refs[1])
-    ]);
+  if (!requestedPool) {
+    const resolved = [];
+    for (const ref of parsed.refs.slice(0, 5)) {
+      const t = await resolveRef(ref, notes);
+      if (t && !resolved.some((r) => r.address === t.address))
+        resolved.push(t);
+      if (resolved.length === 2)
+        break;
+    }
+    if (resolved.length === 2)
+      [tokenIn, tokenOut] = resolved;
   }
   if (tokenIn === null || tokenOut === null) {
     return {
       ok: false,
-      error: `Could not identify two tokens (or one V2 pool) in the request. ${USAGE}`
+      error: `Could not identify two tokens (or one V2 pool) in the request. ` + (notes.length ? `${notes.join(" ")} ` : "") + USAGE
     };
   }
   if (tokenIn.address === tokenOut.address) {
@@ -308,7 +415,7 @@ async function analyzeRequest(text) {
   } else if (best) {
     verdict = best.verdict;
     const other = pools.find((p) => p.pair !== best.pair);
-    recommendation = `Use ${best.dex} (${best.pair}): ${swapLabel} returns ${best.amountOut} ` + `with ${best.priceImpactPct}% price impact.` + (other ? ` Next best is ${other.dex} with ${other.amountOut}.` : " It is the only pool found.") + (best.verdict !== "GREEN" ? ` To stay under 1% impact, keep each order below ${best.maxInUnder1Pct}.` : "");
+    recommendation = `Use ${best.dex}${best.pair ? ` (${best.pair})` : ""}: ${swapLabel} returns ${best.amountOut} ` + `with ${best.priceImpactPct}% price impact.` + (other ? ` Next best is ${other.dex} with ${other.amountOut}.` : " It is the only pool found.") + (best.verdict !== "GREEN" && !best.maxInUnder1Pct.startsWith("n/a") ? ` To stay under 1% impact, keep each order below ${best.maxInUnder1Pct}.` : best.verdict !== "GREEN" ? " Consider splitting the order into smaller swaps." : "");
   } else {
     verdict = "RED";
     recommendation = "No usable route.";
@@ -328,7 +435,8 @@ async function analyzeRequest(text) {
     twoHop,
     verdict,
     recommendation,
-    generatedAt: new Date().toISOString()
+    generatedAt: new Date().toISOString(),
+    notes
   };
 }
 var ICON = { GREEN: "\uD83D\uDFE2", ORANGE: "\uD83D\uDFE0", RED: "\uD83D\uDD34" };
@@ -349,6 +457,10 @@ ${report.error ?? USAGE}
   lines.push(`**Verdict: ${ICON[report.verdict]} ${report.verdict}**`);
   lines.push("");
   lines.push(report.recommendation ?? "");
+  for (const n of report.notes ?? []) {
+    lines.push("");
+    lines.push(`> ${n}`);
+  }
   if (amountAssumed) {
     lines.push("");
     lines.push(`_No amount was given, so 1 ${tokenIn.symbol} was assumed._`);
@@ -364,7 +476,8 @@ ${report.error ?? USAGE}
     }
     lines.push("");
     for (const p of report.pools)
-      lines.push(`- ${p.dex}: \`${p.pair}\``);
+      if (p.pair)
+        lines.push(`- ${p.dex}: \`${p.pair}\``);
   } else {
     lines.push("None found.");
   }
@@ -385,7 +498,8 @@ ${report.error ?? USAGE}
   lines.push("");
   lines.push("- Verdict: GREEN under 1% price impact, ORANGE from 1% to 5%, RED above 5% or no route.");
   lines.push("- LP burned: share of the pool's LP tokens sent to a dead address. A low share means liquidity can be withdrawn; liquidity held in a lock contract is not detected.");
-  lines.push("- V2 (constant-product) pools only, read live from BSC mainnet at " + `${report.generatedAt}. Fees are each DEX's nominal fee. Not financial advice.`);
+  lines.push("- V2 pools are read from their reserves; PancakeSwap V3 is quoted through its on-chain quoter (no reserves, max-order or LP-burned figures for V3).");
+  lines.push(`- Read live from BSC mainnet at ${report.generatedAt}. Fees are each DEX's nominal fee. Not financial advice.`);
   lines.push("");
   lines.push("## Data");
   lines.push("");

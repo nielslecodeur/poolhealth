@@ -111,8 +111,9 @@ export function buildAgentCard(
       `${name} sells a liquidity health report for a swap on BNB Chain. ` +
       'Describe the swap in task_description, e.g. "swap 5 BNB to CAKE", ' +
       '"tokenIn 0x… tokenOut 0x… amount 1000", or a V2 pool address with an ' +
-      "amount. The report gives the price impact on every V2 pool found " +
-      "(PancakeSwap, BiSwap, ApeSwap, MDEX), the largest order that stays " +
+      "amount; any BSC token symbol works. The report gives the price impact " +
+      "on every pool found (PancakeSwap V2 and V3, BiSwap, ApeSwap, MDEX), " +
+      "flags copycat tokens sharing a symbol, the largest order that stays " +
       "under 1% impact, the share of LP tokens burned, a replacement pool or " +
       "two-hop route when the liquidity is too thin, and a GREEN / ORANGE / " +
       "RED verdict. ERC-8183 seller: negotiate + notify_funded over A2A.",

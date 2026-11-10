@@ -4,7 +4,8 @@
 
 Give it a token pair and an amount (or a V2 pool address), and it returns:
 
-- **Price impact for your exact amount** on every V2 pool it finds: PancakeSwap, BiSwap, ApeSwap and MDEX, from live reserves.
+- **Price impact for your exact amount** on every pool it finds: PancakeSwap V2 and V3, BiSwap, ApeSwap and MDEX, from live on-chain data.
+- **Any token by symbol**: type `5 BNB to HYPE` and it picks the most liquid BSC token with that symbol (via DexScreener's public search), and warns when copycat tokens share the name.
 - **The largest order that stays under 1% impact**, so you know when to split a trade.
 - **A replacement pool or a two-hop route** through WBNB or USDT when your pool is too thin.
 - **A rug signal**: the share of LP tokens burned. A low share means the liquidity can be withdrawn.
@@ -74,7 +75,8 @@ pnpm exec tsx scripts/tryReport.ts "swap 5 BNB to CAKE"
 
 ## Limits
 
-- V2 (constant-product) pools only; V3 concentrated liquidity is not covered.
+- V3 is covered for PancakeSwap only, through its quoter: no reserves, max-order or LP-burned figures for V3 pools.
+- A symbol is matched to the most liquid token with that name; pass the address when it matters.
 - Fees are each DEX's nominal fee.
 - LP tokens held in a lock contract are not detected as locked.
 - Not financial advice.

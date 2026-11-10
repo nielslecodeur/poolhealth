@@ -258,6 +258,69 @@ async function quotePool(
   };
 }
 
+// PancakeSwap V3 (concentrated liquidity): quoted through its QuoterV2, one
+// eth_call per fee tier, because V3 depth cannot be read from two reserves.
+const PANCAKE_V3_QUOTER = "0xb048bbc1ee6b733fffcfb9e9cef7375518e25997";
+const V3_FEE_TIERS = [100, 500, 2500, 10000]; // hundredths of a basis point
+
+async function v3Out(
+  tokenIn: Token,
+  tokenOut: Token,
+  amountIn: bigint,
+  fee: number,
+): Promise<bigint | null> {
+  // quoteExactInputSingle((tokenIn, tokenOut, amountIn, fee, sqrtPriceLimitX96))
+  const data =
+    "0xc6a5026a" +
+    pad(tokenIn.address) +
+    pad(tokenOut.address) +
+    amountIn.toString(16).padStart(64, "0") +
+    fee.toString(16).padStart(64, "0") +
+    "0".repeat(64);
+  const out = await callUint(PANCAKE_V3_QUOTER, data);
+  return out !== null && out > 0n ? out : null;
+}
+
+async function quoteV3(
+  tokenIn: Token,
+  tokenOut: Token,
+  amountIn: bigint,
+): Promise<PoolQuote[]> {
+  const probe = amountIn / 1000n > 0n ? amountIn / 1000n : amountIn;
+  const quotes = await Promise.all(
+    V3_FEE_TIERS.map(async (fee): Promise<PoolQuote | null> => {
+      try {
+        const [out, outProbe] = await Promise.all([
+          v3Out(tokenIn, tokenOut, amountIn, fee),
+          v3Out(tokenIn, tokenOut, probe, fee),
+        ]);
+        if (out === null || outProbe === null) return null;
+        // Impact = how much worse the full order's rate is than a tiny one's.
+        const ratio =
+          (Number(out) / Number(amountIn)) / (Number(outProbe) / Number(probe));
+        const priceImpactPct = Math.max(0, (1 - ratio) * 100);
+        return {
+          dex: `PancakeSwap V3 (${fee / 10000}% tier)`,
+          pair: "",
+          feeBps: fee / 100,
+          reserveIn: "n/a (V3)",
+          reserveOut: "n/a (V3)",
+          amountOut: `${formatUnits(out, tokenOut.decimals)} ${tokenOut.symbol}`,
+          amountOutRaw: out,
+          priceImpactPct: round(priceImpactPct, 3),
+          totalLossPct: round(priceImpactPct + fee / 10000, 3),
+          maxInUnder1Pct: "n/a (V3)",
+          lpBurnedPct: null,
+          verdict: verdictFor(priceImpactPct),
+        };
+      } catch {
+        return null;
+      }
+    }),
+  );
+  return quotes.filter((q): q is PoolQuote => q !== null);
+}
+
 /** Quote every known DEX's direct pool for the pair, best output first. */
 async function quoteAllDexes(
   tokenIn: Token,
@@ -265,7 +328,8 @@ async function quoteAllDexes(
   amountIn: bigint,
   withLpBurn: boolean,
 ): Promise<PoolQuote[]> {
-  const quotes = await Promise.all(
+  const v3 = quoteV3(tokenIn, tokenOut, amountIn);
+  const v2 = await Promise.all(
     DEXES.map(async (dex) => {
       try {
         const pair = await findPair(dex, tokenIn.address, tokenOut.address);
@@ -278,17 +342,35 @@ async function quoteAllDexes(
       }
     }),
   );
-  return quotes
-    .filter((q): q is PoolQuote => q !== null)
+  const all = [...v2.filter((q): q is PoolQuote => q !== null), ...(await v3)]
     .sort((a, b) => (a.amountOutRaw > b.amountOutRaw ? -1 : 1));
+  // Near-empty pools (99%+ impact) are noise once a real option exists.
+  const usable = all.filter((q) => q.priceImpactPct < 99);
+  return usable.length > 0 ? usable : all;
 }
 
 // ── request parsing ──────────────────────────────────────────────────────────
 
 interface ParsedRequest {
-  refs: string[]; // addresses (0x…) or canonical symbols, in order of appearance
+  /**
+   * In order of appearance: addresses (0x…), canonical known symbols, or
+   * `?SYMBOL` for any other word that may be a token symbol (resolved later).
+   */
+  refs: string[];
   amount: string | null;
 }
+
+// English and French filler words that are never token symbols.
+const STOPWORDS = new Set(
+  ("swap swaps swapping sell buy trade trading exchange convert change to into " +
+    "for from of on in with and or the a an my me i want how much is it can " +
+    "check pool pools pair amount tokenin tokenout token tokens liquidity route " +
+    "best price impact please what if en vers contre pour de du des le la les un " +
+    "une mon ma mes je veux combien est ce que avec sur et ou dans par echanger " +
+    "échanger vendre acheter convertir analyse analyser verifier vérifier " +
+    "chain smart dex v2 v3")
+    .split(/\s+/),
+);
 
 export function parseRequest(text: string): ParsedRequest {
   // "BNB Chain" / "BNB Smart Chain" name the network, not the token.
@@ -298,10 +380,16 @@ export function parseRequest(text: string): ParsedRequest {
     found.push({ index: m.index ?? 0, ref: m[0].toLowerCase() });
   }
   const noAddr = cleaned.replace(/0x[a-fA-F0-9]{40}/g, (s) => " ".repeat(s.length));
-  const symbols = [...Object.keys(KNOWN_TOKENS), ...Object.keys(SYMBOL_ALIASES)];
-  for (const m of noAddr.matchAll(new RegExp(`\\b(${symbols.join("|")})\\b`, "gi"))) {
-    const sym = m[1]!.toUpperCase();
-    found.push({ index: m.index ?? 0, ref: SYMBOL_ALIASES[sym] ?? sym });
+  // A word may sit right after a number ("5BNB"), so only a LETTER before it
+  // breaks the match.
+  for (const m of noAddr.matchAll(/(?<![A-Za-z])([A-Za-z$][A-Za-z0-9$]{1,14})(?![A-Za-z0-9])/g)) {
+    const word = m[1]!.replace(/^\$/, "");
+    const upper = word.toUpperCase();
+    let ref: string | null = null;
+    if (SYMBOL_ALIASES[upper]) ref = SYMBOL_ALIASES[upper]!;
+    else if (KNOWN_TOKENS[upper]) ref = upper;
+    else if (!STOPWORDS.has(word.toLowerCase()) && word.length >= 2) ref = `?${upper}`;
+    if (ref) found.push({ index: m.index ?? 0, ref });
   }
   found.sort((a, b) => a.index - b.index);
   const refs: string[] = [];
@@ -310,15 +398,94 @@ export function parseRequest(text: string): ParsedRequest {
   const num = "(\\d+(?:[.,]\\d+)?)";
   const amount =
     noAddr.match(new RegExp(`amount\\w*["'\\s:=]*${num}`, "i"))?.[1] ??
-    noAddr.match(new RegExp(`${num}\\s*(?:${symbols.join("|")})\\b`, "i"))?.[1] ??
+    noAddr.match(new RegExp(`${num}\\s*[A-Za-z$]`))?.[1] ??
     noAddr.match(new RegExp(`(?:swap|sell|trade|buy)\\w*\\s+${num}`, "i"))?.[1] ??
+    noAddr.match(/(\d+(?:[.,]\d+)?)/)?.[1] ??
     null;
   return { refs, amount };
 }
 
-async function resolveRef(ref: string): Promise<Token | null> {
+interface SymbolMatch {
+  address: string;
+  candidates: number;
+  liquidityUsd: number;
+  others: { address: string; liquidityUsd: number }[];
+}
+
+/**
+ * Find the BSC token behind a symbol that is not in the built-in list, using
+ * DexScreener's public search (no key). Several unrelated tokens often share a
+ * symbol, so the most liquid one is picked and the others are reported.
+ */
+async function searchSymbol(symbol: string): Promise<SymbolMatch | null> {
+  const queries = [`${symbol} WBNB`, `${symbol} USDT`, symbol];
+  const liq = new Map<string, number>();
+  await Promise.all(
+    queries.map(async (q) => {
+      try {
+        const res = await fetch(
+          `https://api.dexscreener.com/latest/dex/search?q=${encodeURIComponent(q)}`,
+          { signal: AbortSignal.timeout(RPC_TIMEOUT_MS) },
+        );
+        if (!res.ok) return;
+        const body = (await res.json()) as {
+          pairs?: {
+            chainId?: string;
+            pairAddress?: string;
+            baseToken?: { address?: string; symbol?: string };
+            quoteToken?: { address?: string; symbol?: string };
+            liquidity?: { usd?: number };
+          }[];
+        };
+        const seen = new Set<string>();
+        for (const p of body.pairs ?? []) {
+          if (p.chainId !== "bsc" || !p.pairAddress || seen.has(p.pairAddress)) continue;
+          seen.add(p.pairAddress);
+          for (const side of [p.baseToken, p.quoteToken]) {
+            if (side?.address && side.symbol?.toUpperCase() === symbol) {
+              const a = side.address.toLowerCase();
+              liq.set(a, Math.max(liq.get(a) ?? 0, 0) + (p.liquidity?.usd ?? 0));
+            }
+          }
+        }
+      } catch {
+        // search is best-effort; an address always works
+      }
+    }),
+  );
+  if (liq.size === 0) return null;
+  const ranked = [...liq.entries()].sort((a, b) => b[1] - a[1]);
+  const [address, liquidityUsd] = ranked[0]!;
+  return {
+    address,
+    candidates: ranked.length,
+    liquidityUsd,
+    others: ranked.slice(1, 4).map(([a, l]) => ({ address: a, liquidityUsd: l })),
+  };
+}
+
+const usd = (n: number) =>
+  n >= 1e6 ? `$${(n / 1e6).toFixed(1)}M` : n >= 1e3 ? `$${Math.round(n / 1e3)}k` : `$${Math.round(n)}`;
+
+async function resolveRef(ref: string, notes: string[]): Promise<Token | null> {
   if (ref.startsWith("0x")) return loadToken(ref);
-  return KNOWN_TOKENS[ref] ?? null;
+  if (!ref.startsWith("?")) return KNOWN_TOKENS[ref] ?? null;
+  const symbol = ref.slice(1);
+  const match = await searchSymbol(symbol);
+  if (!match) return null;
+  const token = await loadToken(match.address);
+  if (!token) return null;
+  if (match.candidates > 1) {
+    notes.push(
+      `${symbol} matches ${match.candidates} different tokens on BSC. Using ` +
+        `${match.address} (the most liquid, about ${usd(match.liquidityUsd)} listed). ` +
+        `Others: ${match.others.map((o) => `${o.address} (${usd(o.liquidityUsd)})`).join(", ")}. ` +
+        "Copycat tokens reuse popular names: check the address before you trade.",
+    );
+  } else {
+    notes.push(`${symbol} resolved to ${match.address} (about ${usd(match.liquidityUsd)} listed on BSC).`);
+  }
+  return token;
 }
 
 // ── the report ───────────────────────────────────────────────────────────────
@@ -341,13 +508,15 @@ export interface PoolHealthReport {
   verdict?: Verdict;
   recommendation?: string;
   generatedAt?: string;
+  /** How symbols were resolved, ambiguity warnings. */
+  notes?: string[];
 }
 
 const USAGE =
   "Send a token pair and an amount, e.g. \"swap 5 BNB to CAKE\", " +
   "\"tokenIn 0x… tokenOut 0x… amount 1000\", or a single V2 pool address with " +
-  "an amount. Known symbols: BNB, USDT, USDC, BUSD, CAKE, ETH, BTCB; any other " +
-  "BEP-20 token works by address.";
+  "an amount. Any BSC token symbol works (it is looked up by liquidity); a " +
+  "token address is the most precise.";
 
 export async function analyzeRequest(text: string): Promise<PoolHealthReport> {
   const parsed = parseRequest(text);
@@ -355,6 +524,7 @@ export async function analyzeRequest(text: string): Promise<PoolHealthReport> {
   let tokenOut: Token | null = null;
   let requestedPool: string | undefined;
   let requestedFactory: string | null = null;
+  const notes: string[] = [];
 
   // An address that answers token0()/token1() is a V2 pool, not a token: the
   // swap is then between its two tokens, sold in the direction of whichever
@@ -380,17 +550,25 @@ export async function analyzeRequest(text: string): Promise<PoolHealthReport> {
     break;
   }
 
-  if (!requestedPool && parsed.refs.length >= 2) {
-    [tokenIn, tokenOut] = await Promise.all([
-      resolveRef(parsed.refs[0]!),
-      resolveRef(parsed.refs[1]!),
-    ]);
+  if (!requestedPool) {
+    // Resolve candidates in order until two tokens are found. Unknown words
+    // cost a search each, so only the first few are tried.
+    const resolved: Token[] = [];
+    for (const ref of parsed.refs.slice(0, 5)) {
+      const t = await resolveRef(ref, notes);
+      if (t && !resolved.some((r) => r.address === t.address)) resolved.push(t);
+      if (resolved.length === 2) break;
+    }
+    if (resolved.length === 2) [tokenIn, tokenOut] = resolved as [Token, Token];
   }
 
   if (tokenIn === null || tokenOut === null) {
     return {
       ok: false,
-      error: `Could not identify two tokens (or one V2 pool) in the request. ${USAGE}`,
+      error:
+        `Could not identify two tokens (or one V2 pool) in the request. ` +
+        (notes.length ? `${notes.join(" ")} ` : "") +
+        USAGE,
     };
   }
   if (tokenIn.address === tokenOut.address) {
@@ -465,12 +643,14 @@ export async function analyzeRequest(text: string): Promise<PoolHealthReport> {
     verdict = best.verdict;
     const other = pools.find((p) => p.pair !== best.pair);
     recommendation =
-      `Use ${best.dex} (${best.pair}): ${swapLabel} returns ${best.amountOut} ` +
+      `Use ${best.dex}${best.pair ? ` (${best.pair})` : ""}: ${swapLabel} returns ${best.amountOut} ` +
       `with ${best.priceImpactPct}% price impact.` +
       (other ? ` Next best is ${other.dex} with ${other.amountOut}.` : " It is the only pool found.") +
-      (best.verdict !== "GREEN"
+      (best.verdict !== "GREEN" && !best.maxInUnder1Pct.startsWith("n/a")
         ? ` To stay under 1% impact, keep each order below ${best.maxInUnder1Pct}.`
-        : "");
+        : best.verdict !== "GREEN"
+          ? " Consider splitting the order into smaller swaps."
+          : "");
   } else {
     verdict = "RED";
     recommendation = "No usable route.";
@@ -495,6 +675,7 @@ export async function analyzeRequest(text: string): Promise<PoolHealthReport> {
     verdict,
     recommendation,
     generatedAt: new Date().toISOString(),
+    notes,
   };
 }
 
@@ -522,6 +703,10 @@ export function renderReport(report: PoolHealthReport, analystNote: string): str
   lines.push(`**Verdict: ${ICON[report.verdict]} ${report.verdict}**`);
   lines.push("");
   lines.push(report.recommendation ?? "");
+  for (const n of report.notes ?? []) {
+    lines.push("");
+    lines.push(`> ${n}`);
+  }
   if (amountAssumed) {
     lines.push("");
     lines.push(`_No amount was given, so 1 ${tokenIn.symbol} was assumed._`);
@@ -541,7 +726,7 @@ export function renderReport(report: PoolHealthReport, analystNote: string): str
       );
     }
     lines.push("");
-    for (const p of report.pools) lines.push(`- ${p.dex}: \`${p.pair}\``);
+    for (const p of report.pools) if (p.pair) lines.push(`- ${p.dex}: \`${p.pair}\``);
   } else {
     lines.push("None found.");
   }
@@ -568,7 +753,8 @@ export function renderReport(report: PoolHealthReport, analystNote: string): str
   lines.push("");
   lines.push("- Verdict: GREEN under 1% price impact, ORANGE from 1% to 5%, RED above 5% or no route.");
   lines.push("- LP burned: share of the pool's LP tokens sent to a dead address. A low share means liquidity can be withdrawn; liquidity held in a lock contract is not detected.");
-  lines.push("- V2 (constant-product) pools only, read live from BSC mainnet at " + `${report.generatedAt}. Fees are each DEX's nominal fee. Not financial advice.`);
+  lines.push("- V2 pools are read from their reserves; PancakeSwap V3 is quoted through its on-chain quoter (no reserves, max-order or LP-burned figures for V3).");
+  lines.push(`- Read live from BSC mainnet at ${report.generatedAt}. Fees are each DEX's nominal fee. Not financial advice.`);
   lines.push("");
   lines.push("## Data");
   lines.push("");
